@@ -629,7 +629,12 @@ impl GeneralizedDatabase {
             // Edge cases that can make this true:
             //   1. Account was destroyed and created again afterwards.
             //   2. Account was destroyed but then was sent ETH, so it's not going to be completely removed from the trie.
-            let was_destroyed = new_state_account.status == AccountStatus::DestroyedModified;
+            // A `Destroyed` account may hold slots too: a reverted re-creation puts back
+            // the zeros its writes replaced, and those have no old value either.
+            let was_destroyed = matches!(
+                new_state_account.status,
+                AccountStatus::Destroyed | AccountStatus::DestroyedModified
+            );
             // Only emit removed_storage if the account actually had storage in the trie.
             // If it didn't (e.g. account was created within the batch), there's nothing to
             // remove, and emitting removed_storage=true would cause a spurious empty
@@ -733,31 +738,69 @@ impl GeneralizedDatabase {
                 None
             };
 
-            // Account will have only its storage removed if it was Destroyed and then modified
-            // Edge cases that can make this true:
+            // Whether the diff baseline is already a post-destruction state: an earlier
+            // batch of this block destroyed the account, and the fold below carried the
+            // status over so reads of slots not written since keep returning zero instead
+            // of the stale storage still in the store. The baseline's storage then holds
+            // every slot committed since the destruction, and a slot absent from it is
+            // zero, so this batch diffs against those committed values: diffing against
+            // zero again, as if the account had just been destroyed, dropped a write of
+            // zero to a committed slot, and the slot kept its stale value in the trie.
+            let baseline_destroyed = matches!(
+                initial_state_account.status,
+                AccountStatus::Destroyed | AccountStatus::DestroyedModified
+            );
+            let currently_destroyed = matches!(
+                new_state_account.status,
+                AccountStatus::Destroyed | AccountStatus::DestroyedModified
+            );
+            // Destroyed within this batch: whatever storage it had, in the trie or
+            // committed by earlier batches, is gone, so every slot's old value is zero.
+            // Edge cases that make this true for an account still holding slots:
             //   1. Account was destroyed and created again afterwards.
             //   2. Account was destroyed but then was sent ETH, so it's not going to be completely removed from the trie.
-            let was_destroyed = new_state_account.status == AccountStatus::DestroyedModified;
+            //   3. A re-creation of a `Destroyed` account was reverted, which puts back
+            //      the zeros its writes replaced.
+            let destroyed_this_batch = currently_destroyed && !baseline_destroyed;
             // Only emit removed_storage if the account actually had storage in the trie.
             // If it didn't (e.g. account was created within the batch), there's nothing to
             // remove, and emitting removed_storage=true would cause a spurious empty
             // account to be inserted into the state trie.
-            let removed_storage = was_destroyed && initial_state_account.has_storage;
+            let removed_storage = destroyed_this_batch && initial_state_account.has_storage;
 
             // 2. Storage has been updated if the current value is different from the one before execution.
             let mut added_storage: SeededHashMap<_, _> = Default::default();
 
             for (key, new_value) in &new_state_account.storage {
-                let old_value = if !was_destroyed {
-                    initial_state_account.storage.get(key).ok_or_else(|| { VMError::Internal(InternalError::Custom(format!("Failed to get old value from account's initial storage for address: {address}")))})?
-                } else {
+                let old_value = if destroyed_this_batch {
                     // There's not an "old value" if the contract was destroyed and re-created.
-                    &ZERO_U256
+                    ZERO_U256
+                } else if baseline_destroyed {
+                    initial_state_account
+                        .storage
+                        .get(key)
+                        .copied()
+                        .unwrap_or(ZERO_U256)
+                } else {
+                    *initial_state_account.storage.get(key).ok_or_else(|| { VMError::Internal(InternalError::Custom(format!("Failed to get old value from account's initial storage for address: {address}")))})?
                 };
 
-                if new_value != old_value {
+                if *new_value != old_value {
                     added_storage.insert(*key, *new_value);
                     storage_updated = true;
+                }
+            }
+
+            // The account is loaded with a full copy of a post-destruction baseline, so a
+            // slot the baseline committed that the account no longer holds was cleared by
+            // a destruction within this batch: delete it from the trie, where it is the
+            // only storage the account has left.
+            if baseline_destroyed && currently_destroyed {
+                for (key, old_value) in &initial_state_account.storage {
+                    if !old_value.is_zero() && !new_state_account.storage.contains_key(key) {
+                        added_storage.insert(*key, ZERO_U256);
+                        storage_updated = true;
+                    }
                 }
             }
 

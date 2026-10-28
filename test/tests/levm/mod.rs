@@ -6,6 +6,7 @@ mod bal_view_tests;
 mod bls12_tests;
 mod buffer_pool_tests;
 mod call_args_tests;
+mod destroyed_flush_diff_tests;
 mod destroyed_refault_tests;
 mod difffuzz_bls;
 mod difffuzz_ops;

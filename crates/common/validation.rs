@@ -151,6 +151,26 @@ pub fn validate_requests_hash(
     Ok(())
 }
 
+/// Validates that the burned fees match the block header (LStar+, EIP-8079).
+///
+/// Whether the field may be present at all for the block's fork is checked before
+/// execution by the header validators; here the value the block commits to is compared
+/// with the one execution computed, as the receipts root and requests hash are. Without
+/// this, any value a block claimed was accepted, so the field was never authenticated.
+pub fn validate_burned_fees(
+    header: &BlockHeader,
+    chain_config: &ChainConfig,
+    computed_burned_fees: Option<u64>,
+) -> Result<(), InvalidBlockError> {
+    if !chain_config.is_lstar_activated(header.timestamp) {
+        return Ok(());
+    }
+    if header.burned_fees != computed_burned_fees {
+        return Err(InvalidBlockError::BurnedFeesMismatch);
+    }
+    Ok(())
+}
+
 /// Helper to validate that all indices in an iterator are within bounds.
 fn validate_bal_indices(
     indices: impl Iterator<Item = u32>,

@@ -1066,6 +1066,27 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    /// Whether `block_hash` is a pending block: one we hold but have not executed, so
+    /// nothing about it is known to be valid, whether or not its header is also stored.
+    pub async fn has_pending_block(&self, block_hash: BlockHash) -> Result<bool, StoreError> {
+        Ok(self
+            .read_async(PENDING_BLOCKS, block_hash.as_bytes().to_vec())
+            .await?
+            .is_some())
+    }
+
+    /// Forgets the pending entries of blocks that have now been executed, in one write.
+    fn remove_pending_blocks(
+        &self,
+        block_hashes: impl Iterator<Item = BlockHash>,
+    ) -> Result<(), StoreError> {
+        let mut txn = self.backend.begin_write()?;
+        for block_hash in block_hashes {
+            txn.delete(PENDING_BLOCKS, block_hash.as_bytes())?;
+        }
+        txn.commit()
+    }
+
     /// Add block number for a given hash
     pub async fn add_block_number(
         &self,
@@ -2297,6 +2318,11 @@ impl Store {
         // any reader opening this root blocks in `gated_snapshot` until the
         // layer is installed rather than snapshotting a stale cache.
         self.pending_trie_roots.register(last_state_root)?;
+
+        // These blocks have been executed: they are no longer pending, whichever path
+        // stashed them (a parent we did not have, or a parent whose state we could not
+        // reach), so the engine may answer for them as for any validated block.
+        self.remove_pending_blocks(blocks.iter().map(Block::hash))?;
 
         // Pair blocks with receipts. Single-block fast path avoids a HashMap
         // allocation; full-sync batch joins by hash.

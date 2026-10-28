@@ -13,6 +13,7 @@ mod missing_rpc_methods_tests;
 mod new_payload_bal_tests;
 mod new_payload_duplicate_tests;
 mod new_payload_known_canonical_tests;
+mod new_payload_stashed_tests;
 mod precompile_move_tests;
 mod raw_receipts_completeness_tests;
 mod send_raw_transaction_tests;

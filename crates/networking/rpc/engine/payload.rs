@@ -1388,6 +1388,11 @@ async fn try_execute_payload(
     // Set when the block is re-executed only to rebuild evicted state for a block we had
     // already accepted: one on our canonical chain, at or below our head.
     let mut reexecuting_canonical_block = false;
+    // A stashed payload (the ACCEPTED stash below) has its header and body stored but
+    // was never executed, so nothing about it is known to be valid: the state root it
+    // claims may be another block's, and its parent may be a stashed payload too. It
+    // is answered as on its first delivery, never from the known-block fast path.
+    let stashed = storage.has_pending_block(block_hash).await?;
     // Fast path: if we already have this block's header AND its state is reachable,
     // we know it has been fully validated previously and can reply VALID (with a
     // witness if requested) without re-execution.
@@ -1403,7 +1408,7 @@ async fn try_execute_payload(
     // overlay install wiped the layer cache), as long as the parent state IS
     // reachable so the re-execution can succeed. This rebuilds the layer and
     // prevents subsequent FCUs from looping back into `reorg_apply_deep`.
-    if let Some(known_header) = storage.get_block_header_by_hash(block_hash)? {
+    if !stashed && let Some(known_header) = storage.get_block_header_by_hash(block_hash)? {
         let state_materialized = storage.is_state_in_layer_cache(known_header.state_root)?
             || storage.has_state_root(known_header.state_root)?;
         if state_materialized {
@@ -1420,10 +1425,7 @@ async fn try_execute_payload(
         // for execution to make progress. Otherwise preserve the legacy
         // snap-sync fast-path and reply VALID without re-execution.
         let parent_reachable = match storage.get_block_header_by_hash(block.header.parent_hash)? {
-            Some(parent) => {
-                storage.is_state_in_layer_cache(parent.state_root)?
-                    || storage.has_state_root(parent.state_root)?
-            }
+            Some(parent) => parent_state_reachable(storage, &parent).await?,
             None => false,
         };
         if !parent_reachable {
@@ -1465,20 +1467,20 @@ async fn try_execute_payload(
     // returns `ChainError::ParentNotFound` and stashes the block; handled
     // below as `SYNCING`, preserving existing behavior.
     let parent_header = storage.get_block_header_by_hash(block.header.parent_hash)?;
-    if let Some(parent_header) = &parent_header {
-        let parent_state = parent_header.state_root;
-        let in_cache = storage.is_state_in_layer_cache(parent_state)?;
-        let on_disk = !in_cache && storage.has_state_root(parent_state)?;
-        if !in_cache && !on_disk {
-            debug!(
-                %block_hash,
-                %block_number,
-                parent_hash = %block.header.parent_hash,
-                "Parent state not materialized; stashing payload as ACCEPTED"
-            );
-            storage.add_block(block).await?;
-            return Ok(PayloadStatus::accepted());
-        }
+    if let Some(parent_header) = &parent_header
+        && !parent_state_reachable(storage, parent_header).await?
+    {
+        debug!(
+            %block_hash,
+            %block_number,
+            parent_hash = %block.header.parent_hash,
+            "Parent state not materialized; stashing payload as ACCEPTED"
+        );
+        // Marked pending first, so no reader finds the header of an unexecuted block
+        // without the mark.
+        storage.add_pending_block(block.clone())?;
+        storage.add_block(block).await?;
+        return Ok(PayloadStatus::accepted());
     }
 
     // Execute and store the block, unless a request for it is already doing so: a
@@ -1691,6 +1693,18 @@ async fn classify_execution(
             Ok(status)
         }
     }
+}
+
+/// Whether a payload built on `parent` can be executed: the parent has been validated
+/// and its post-state is in the layer cache or on disk. A stashed, unexecuted payload's
+/// state root is only a claim, possibly another block's, so its children are stashed
+/// too instead of being executed on whatever state that root names.
+async fn parent_state_reachable(storage: &Store, parent: &BlockHeader) -> Result<bool, RpcErr> {
+    if storage.has_pending_block(parent.hash()).await? {
+        return Ok(false);
+    }
+    Ok(storage.is_state_in_layer_cache(parent.state_root)?
+        || storage.has_state_root(parent.state_root)?)
 }
 
 async fn payload_status_for_existing_block(

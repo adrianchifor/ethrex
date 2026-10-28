@@ -37,3 +37,4 @@ mod simulation_env_tests;
 mod stack_tests;
 mod trace_call_tests;
 mod transient_storage_tests;
+mod warm_txs_grouping_tests;

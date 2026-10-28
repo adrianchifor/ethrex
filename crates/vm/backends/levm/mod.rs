@@ -79,8 +79,6 @@ use ethrex_levm::{
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 #[cfg(feature = "rayon")]
 use rayon::slice::ParallelSlice;
-#[cfg(feature = "rayon")]
-use rustc_hash::FxHashMap;
 use std::cmp::min;
 use std::sync::Arc;
 #[cfg(feature = "rayon")]
@@ -3395,6 +3393,31 @@ impl LEVM {
         crypto: &dyn Crypto,
         cancelled: &AtomicBool,
     ) -> Result<(), EvmError> {
+        // Warming is speculative work on behalf of the executor: a block the executor
+        // rejects before or at its first transaction is not worth any of it, and the
+        // checks that tell are cheap. The minimum-work bound keeps the sender
+        // recovery below within what the gas limit allows, and a Frame transaction
+        // that fails its static constraints rejects the block on its own, with no
+        // signature to recover: a payload could carry tens of thousands of them with
+        // senders chosen to collide in the sender grouping.
+        if matches!(vm_type, VMType::L1) {
+            let chain_config = store.get_chain_config()?;
+            if check_minimum_block_work_before_recovery(
+                &block.body.transactions,
+                chain_config.fork(block.header.timestamp),
+                block.header.gas_limit,
+            )
+            .is_err()
+            {
+                return Ok(());
+            }
+        }
+        if block.body.transactions.iter().any(|tx| {
+            matches!(tx, Transaction::FrameTransaction(frame) if frame.validate_static_constraints().is_err())
+        }) {
+            return Ok(());
+        }
+
         let txs_with_sender = block
             .body
             .get_transactions_with_sender(crypto)
@@ -3445,9 +3468,17 @@ impl LEVM {
         should_stop: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), EvmError> {
         // Group by sender so nonce/balance changes propagate within a group
-        // (inspired by Nethermind's per-sender prewarmer).
-        let mut sender_groups: FxHashMap<Address, Vec<&Transaction>> = FxHashMap::default();
+        // (inspired by Nethermind's per-sender prewarmer). Seeded: Frame
+        // transactions name their sender outright, so a payload can choose
+        // senders that collide under a fixed hash and turn the grouping
+        // quadratic. The executor may reject the block while this runs, so the
+        // stop flag is polled here too, not only once execution starts.
+        let mut sender_groups: SeededHashMap<Address, Vec<&Transaction>> =
+            SeededHashMap::with_capacity_and_hasher(txs_with_sender.len(), Default::default());
         for (tx, sender) in txs_with_sender {
+            if should_stop() {
+                return Ok(());
+            }
             sender_groups.entry(*sender).or_default().push(tx);
         }
 

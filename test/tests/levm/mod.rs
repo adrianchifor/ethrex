@@ -1,6 +1,7 @@
 mod test_db;
 
 mod bal_coinbase_tests;
+mod bal_net_zero_cleanup_tests;
 mod bal_selfdestruct_reads_tests;
 mod bal_view_tests;
 mod bls12_tests;

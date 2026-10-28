@@ -79,7 +79,7 @@ fn added(update: &AccountUpdate) -> Vec<(u64, u64)> {
     let mut added: Vec<(u64, u64)> = update
         .added_storage
         .iter()
-        .map(|(key, value)| (key.to_low_u64_be(), value.as_u64()))
+        .map(|(key, value)| (key.to_low_u64_be(), value.low_u64()))
         .collect();
     added.sort_unstable();
     added

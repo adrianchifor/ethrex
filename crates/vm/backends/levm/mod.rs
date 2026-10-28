@@ -45,7 +45,7 @@ use ethrex_common::{
     BigEndianHash, constants::AMSTERDAM_MAX_CODE_SIZE, validate_bal_code_sizes,
     validate_block_access_list_size, validate_header_bal_indices,
 };
-use ethrex_crypto::Crypto;
+use ethrex_crypto::{Crypto, CryptoError};
 use ethrex_levm::EVMConfig;
 use ethrex_levm::StatelessValidator;
 #[cfg(feature = "rayon")]
@@ -76,7 +76,7 @@ use ethrex_levm::{
     vm::VM,
 };
 #[cfg(feature = "rayon")]
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 #[cfg(feature = "rayon")]
 use rayon::slice::ParallelSlice;
 #[cfg(feature = "rayon")]
@@ -246,6 +246,96 @@ pub fn check_minimum_block_work<'a>(
         }
     }
     Ok(())
+}
+
+/// [`check_minimum_block_work`] before any sender has been recovered.
+///
+/// A transaction's floor depends on its sender only through the EIP-2780 self-transfer
+/// discount, so taking the recipient as every transaction's sender gives each floor its
+/// lowest possible value and keeps the bound sound. Recovering a sender is the one
+/// expensive thing done for a transaction before anything is checked, so without this a
+/// block of unexecutable transactions, as many as its body may carry, cost the recovery
+/// of every one of them before being rejected: about 80 seconds for 620,000.
+pub fn check_minimum_block_work_before_recovery(
+    transactions: &[Transaction],
+    fork: Fork,
+    block_gas_limit: u64,
+) -> Result<(), EvmError> {
+    check_minimum_block_work(
+        transactions.iter().map(|tx| (tx, lowest_floor_sender(tx))),
+        fork,
+        block_gas_limit,
+    )
+}
+
+/// The sender that gives `tx` the lowest intrinsic gas floor: its recipient, so a call
+/// counts as a self-transfer. A creation's floor does not depend on the sender.
+fn lowest_floor_sender(tx: &Transaction) -> Address {
+    match tx.to() {
+        TxKind::Call(to) => to,
+        TxKind::Create => Address::zero(),
+    }
+}
+
+/// How many senders [`OrderedSenders`] recovers ahead of the sequential execution loop
+/// at once: enough to keep every core busy, few enough that a block rejected early pays
+/// for little recovery past the rejecting transaction.
+const SENDER_RECOVERY_CHUNK: usize = 256;
+
+/// Senders of a block's transactions, recovered in transaction order a chunk at a time
+/// as the sequential path consumes them, instead of all of them before the first
+/// transaction runs. A block with an early terminal error, say a nonce mismatch at its
+/// second transaction followed by hundreds of thousands of unexecutable ones, then costs
+/// at most one chunk of recovery past the error. An unrecoverable signature surfaces at
+/// its own position, after every transaction before it has run.
+struct OrderedSenders<'a> {
+    transactions: &'a [Transaction],
+    crypto: &'a dyn Crypto,
+    next: usize,
+    recovered: std::collections::VecDeque<Result<(&'a Transaction, Address), CryptoError>>,
+}
+
+impl<'a> OrderedSenders<'a> {
+    fn new(transactions: &'a [Transaction], crypto: &'a dyn Crypto) -> Self {
+        Self {
+            transactions,
+            crypto,
+            next: 0,
+            recovered: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn recover_next_chunk(&mut self) {
+        let end = self
+            .transactions
+            .len()
+            .min(self.next.saturating_add(SENDER_RECOVERY_CHUNK));
+        let chunk = &self.transactions[self.next..end];
+        self.next = end;
+        let crypto = self.crypto;
+        #[cfg(feature = "rayon")]
+        let senders = chunk
+            .par_iter()
+            .map(|tx| tx.sender(crypto).map(|sender| (tx, sender)))
+            .collect::<Vec<_>>();
+        #[cfg(not(feature = "rayon"))]
+        let senders = chunk
+            .iter()
+            .map(|tx| tx.sender(crypto).map(|sender| (tx, sender)))
+            .collect::<Vec<_>>();
+        self.recovered.extend(senders);
+    }
+}
+
+impl<'a> Iterator for OrderedSenders<'a> {
+    type Item = Result<(&'a Transaction, Address), CryptoError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.recovered.is_empty() && self.next < self.transactions.len() {
+            self.recover_next_chunk();
+        }
+        self.recovered.pop_front()
+    }
 }
 
 /// Gas spent so far by the transactions parallel execution has finished, per EIP-8037
@@ -482,15 +572,19 @@ impl LEVM {
         // EIP-8037 (Amsterdam+): track regular and state gas separately for block-level max()
         let mut block_regular_gas_used = 0_u64;
         let mut block_state_gas_used = 0_u64;
-        let transactions_with_sender =
-            block
-                .body
-                .get_transactions_with_sender(crypto)
-                .map_err(|error| {
-                    EvmError::Transaction(format!("Couldn't recover addresses with error: {error}"))
-                })?;
+        if matches!(vm_type, VMType::L1) {
+            check_minimum_block_work_before_recovery(
+                &block.body.transactions,
+                chain_config.fork(block.header.timestamp),
+                block.header.gas_limit,
+            )?;
+        }
 
-        for (tx_idx, (tx, tx_sender)) in transactions_with_sender.into_iter().enumerate() {
+        for (tx_idx, recovered) in OrderedSenders::new(&block.body.transactions, crypto).enumerate()
+        {
+            let (tx, tx_sender) = recovered.map_err(|error| {
+                EvmError::Transaction(format!("Couldn't recover addresses with error: {error}"))
+            })?;
             // Pre-tx gas limit guard:
             // Pre-Amsterdam: reject tx if cumulative post-refund gas + tx.gas > block limit.
             // Amsterdam+: skip — EIP-8037's 2D gas model means cumulative gas (regular +
@@ -695,13 +789,13 @@ impl LEVM {
             "tx count overflows u32 BlockAccessIndex"
         );
 
-        let transactions_with_sender =
-            block
-                .body
-                .get_transactions_with_sender(crypto)
-                .map_err(|error| {
-                    EvmError::Transaction(format!("Couldn't recover addresses with error: {error}"))
-                })?;
+        if matches!(vm_type, VMType::L1) {
+            check_minimum_block_work_before_recovery(
+                &block.body.transactions,
+                chain_config.fork(block.header.timestamp),
+                block.header.gas_limit,
+            )?;
+        }
 
         #[cfg(not(feature = "rayon"))]
         // Without rayon there is no parallel BAL path, so these are unused.
@@ -751,6 +845,15 @@ impl LEVM {
             // Drain system call state and snapshot for per-tx db seeding
             LEVM::get_state_transitions_tx(db)?;
             let system_seed = Arc::new(std::mem::take(&mut db.initial_accounts_state));
+
+            // Parallel execution needs every sender up front; the bound above keeps the
+            // count worth recovering within what the block's gas limit allows.
+            let transactions_with_sender = block
+                .body
+                .get_transactions_with_sender(crypto)
+                .map_err(|error| {
+                    EvmError::Transaction(format!("Couldn't recover addresses with error: {error}"))
+                })?;
 
             let parallel_result = Self::execute_block_parallel(
                 block,
@@ -991,7 +1094,11 @@ impl LEVM {
         // The value itself can be safely changed.
         let mut tx_since_last_flush = 2;
 
-        for (tx_idx, (tx, tx_sender)) in transactions_with_sender.into_iter().enumerate() {
+        for (tx_idx, recovered) in OrderedSenders::new(&block.body.transactions, crypto).enumerate()
+        {
+            let (tx, tx_sender) = recovered.map_err(|error| {
+                EvmError::Transaction(format!("Couldn't recover addresses with error: {error}"))
+            })?;
             // Pre-tx gas limit guard:
             // Pre-Amsterdam: reject tx if cumulative post-refund gas + tx.gas > block limit.
             // Amsterdam+: skip — EIP-8037's 2D gas model means cumulative gas (regular +

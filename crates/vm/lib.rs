@@ -12,6 +12,7 @@ pub use backends::levm::check_2d_gas_allowance;
 /// Bounds the parallel Amsterdam path uses to reject an over-limit block early.
 pub use backends::levm::{
     CompletedGas, EarliestBalError, block_work_budget, check_minimum_block_work,
+    check_minimum_block_work_before_recovery,
 };
 pub use backends::{
     BlockExecutionResult, Evm, TxGasBreakdown, TxStatus, compute_burned_fees, log_gas_used_mismatch,
